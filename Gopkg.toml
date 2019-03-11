@@ -32,7 +32,7 @@
 
 [[constraint]]
   name = "github.com/hashicorp/vault"
-  version = "=0.10.1"
+  version = "=1.0.3"
 
 [[constraint]]
   name = "github.com/kelseyhightower/memkv"
