@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"path"
+	"strings"
 
 	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/kelseyhightower/confd/log"
@@ -180,7 +182,21 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 	vars := make(map[string]string)
 	for key := range branches {
 		log.Debug("getting %s from vault", key)
-		resp, err := c.client.Logical().Read(key)
+		mountPath, v2, pathError := isKVv2(key, c.client)
+		if pathError != nil {
+			log.Debug("Error checking version %s: %s", key, pathError)
+			return nil, pathError
+		}
+
+		versionParam := map[string]string{} // Always get latest version
+
+		kvpath := key
+		if v2 {
+			kvpath = addPrefixToVKVPath(key, mountPath, "data")
+			log.Debug("Prefix added to the kv path %v", kvpath)
+		}
+
+		resp, err := kvReadRequest(c.client, kvpath, versionParam)
 
 		if err != nil {
 			log.Debug("there was an error extracting %s", key)
@@ -249,7 +265,18 @@ func walkTree(c *Client, key string, branches map[string]bool) error {
 	}
 	branches[key] = true
 
-	resp, err := c.client.Logical().List(key)
+	mountPath, v2, pathError := isKVv2(key, c.client)
+	if pathError != nil {
+		log.Debug("there was an error extracting %s %s", key, pathError.Error())
+		return pathError
+	}
+
+	kvpath := key
+	if v2 {
+		kvpath = addPrefixToVKVPath(key, mountPath, "metadata")
+	}
+
+	resp, err := c.client.Logical().List(kvpath)
 
 	if err != nil {
 		log.Debug("there was an error extracting %s", key)
@@ -286,4 +313,105 @@ func walkTree(c *Client, key string, branches map[string]bool) error {
 func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, stopChan chan bool) (uint64, error) {
 	<-stopChan
 	return 0, nil
+}
+
+func kvPreflightVersionRequest(client *vaultapi.Client, path string) (string, int, error) {
+	// We don't want to use a wrapping call here so save any custom value and
+	// restore after
+	currentWrappingLookupFunc := client.CurrentWrappingLookupFunc()
+	client.SetWrappingLookupFunc(nil)
+	defer client.SetWrappingLookupFunc(currentWrappingLookupFunc)
+	currentOutputCurlString := client.OutputCurlString()
+	client.SetOutputCurlString(false)
+	defer client.SetOutputCurlString(currentOutputCurlString)
+
+	r := client.NewRequest("GET", "/v1/sys/internal/ui/mounts/"+path)
+	resp, err := client.RawRequest(r)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	if err != nil {
+		// If we get a 404 we are using an older version of vault, default to
+		// version 1
+		if resp != nil && resp.StatusCode == 404 {
+			return "", 1, nil
+		}
+
+		return "", 0, err
+	}
+
+	secret, err := vaultapi.ParseSecret(resp.Body)
+	if err != nil {
+		return "", 0, err
+	}
+	var mountPath string
+	if mountPathRaw, ok := secret.Data["path"]; ok {
+		mountPath = mountPathRaw.(string)
+	}
+	options := secret.Data["options"]
+	if options == nil {
+		return mountPath, 1, nil
+	}
+	versionRaw := options.(map[string]interface{})["version"]
+	if versionRaw == nil {
+		return mountPath, 1, nil
+	}
+	version := versionRaw.(string)
+	switch version {
+	case "", "1":
+		return mountPath, 1, nil
+	case "2":
+		return mountPath, 2, nil
+	}
+
+	return mountPath, 1, nil
+}
+
+func isKVv2(path string, client *vaultapi.Client) (string, bool, error) {
+	mountPath, version, err := kvPreflightVersionRequest(client, path)
+	if err != nil {
+		return "", false, err
+	}
+
+	return mountPath, version == 2, nil
+}
+
+func addPrefixToVKVPath(p, mountPath, apiPrefix string) string {
+	switch {
+	case p == mountPath, p == strings.TrimSuffix(mountPath, "/"):
+		return path.Join(mountPath, apiPrefix)
+	default:
+		p = strings.TrimPrefix(p, mountPath)
+		return path.Join(mountPath, apiPrefix, p)
+	}
+}
+
+func kvReadRequest(client *vaultapi.Client, path string, params map[string]string) (*vaultapi.Secret, error) {
+	r := client.NewRequest("GET", "/v1/"+path)
+	for k, v := range params {
+		r.Params.Set(k, v)
+	}
+	resp, err := client.RawRequest(r)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	if resp != nil && resp.StatusCode == 404 {
+		secret, parseErr := vaultapi.ParseSecret(resp.Body)
+		switch parseErr {
+		case nil:
+		case io.EOF:
+			return nil, nil
+		default:
+			return nil, err
+		}
+		if secret != nil && (len(secret.Warnings) > 0 || len(secret.Data) > 0) {
+			return secret, nil
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return vaultapi.ParseSecret(resp.Body)
 }
