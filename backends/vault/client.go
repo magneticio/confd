@@ -192,7 +192,8 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 
 		kvpath := key
 		if v2 {
-			kvpath = addPrefixToVKVPath(key, mountPath, "data")
+			kvpath = sanitizePath(kvpath)
+			kvpath = addPrefixToVKVPath(kvpath, mountPath, "data")
 			log.Debug("Prefix added to the kv path %v", kvpath)
 		}
 
@@ -203,9 +204,9 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 			return nil, err
 		}
 		if resp == nil || resp.Data == nil {
+			log.Debug("Response is empty or no data for key %s", key)
 			continue
 		}
-
 		// if the key has only one string value
 		// treat it as a string and not a map of values
 		if val, ok := isKV(resp.Data); ok {
@@ -261,6 +262,7 @@ func walkTree(c *Client, key string, branches map[string]bool) error {
 	}
 	if branches[key] {
 		// already processed this branch
+		log.Debug("already processed this branch %s", key)
 		return nil
 	}
 	branches[key] = true
@@ -273,7 +275,8 @@ func walkTree(c *Client, key string, branches map[string]bool) error {
 
 	kvpath := key
 	if v2 {
-		kvpath = addPrefixToVKVPath(key, mountPath, "metadata")
+		kvpath = ensureTrailingSlash(sanitizePath(kvpath))
+		kvpath = addPrefixToVKVPath(kvpath, mountPath, "metadata")
 	}
 
 	resp, err := c.client.Logical().List(kvpath)
@@ -283,6 +286,7 @@ func walkTree(c *Client, key string, branches map[string]bool) error {
 		return err
 	}
 	if resp == nil || resp.Data == nil || resp.Data["keys"] == nil {
+		log.Debug("Empty list for key %s", key)
 		return nil
 	}
 
@@ -402,7 +406,7 @@ func kvReadRequest(client *vaultapi.Client, path string, params map[string]strin
 		case io.EOF:
 			return nil, nil
 		default:
-			return nil, err
+			return nil, parseErr
 		}
 		if secret != nil && (len(secret.Warnings) > 0 || len(secret.Data) > 0) {
 			return secret, nil
@@ -412,6 +416,49 @@ func kvReadRequest(client *vaultapi.Client, path string, params map[string]strin
 	if err != nil {
 		return nil, err
 	}
-
 	return vaultapi.ParseSecret(resp.Body)
+}
+
+// sanitizePath removes any leading or trailing things from a "path".
+func sanitizePath(s string) string {
+	return ensureNoTrailingSlash(ensureNoLeadingSlash(strings.TrimSpace(s)))
+}
+
+// ensureTrailingSlash ensures the given string has a trailing slash.
+func ensureTrailingSlash(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	for len(s) > 0 && s[len(s)-1] != '/' {
+		s = s + "/"
+	}
+	return s
+}
+
+// ensureNoTrailingSlash ensures the given string has a trailing slash.
+func ensureNoTrailingSlash(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	for len(s) > 0 && s[len(s)-1] == '/' {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// ensureNoLeadingSlash ensures the given string has a trailing slash.
+func ensureNoLeadingSlash(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	for len(s) > 0 && s[0] == '/' {
+		s = s[1:]
+	}
+	return s
 }
