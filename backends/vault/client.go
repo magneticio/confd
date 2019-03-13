@@ -207,16 +207,25 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 			log.Debug("Response is empty or no data for key %s", key)
 			continue
 		}
+
+		data := resp.Data
+		if v2 && data != nil {
+			data = nil
+			dataRaw := resp.Data["data"]
+			if dataRaw != nil {
+				data = dataRaw.(map[string]interface{})
+			}
+		}
 		// if the key has only one string value
 		// treat it as a string and not a map of values
-		if val, ok := isKV(resp.Data); ok {
+		if val, ok := isKV(data); ok {
 			vars[key] = val
 		} else {
 			// save the json encoded response
 			// and flatten it to allow usage of gets & getvs
-			js, _ := json.Marshal(resp.Data)
+			js, _ := json.Marshal(data)
 			vars[key] = string(js)
-			flatten(key, resp.Data, vars)
+			flatten(key, data, vars)
 		}
 	}
 	return vars, nil
